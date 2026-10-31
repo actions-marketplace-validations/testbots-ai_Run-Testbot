@@ -6,61 +6,29 @@
 
 Run TestBots directly from GitHub Actions and publish execution results inside your GitHub workflow.
 
----
-
-# Overview
-
-This GitHub Action allows you to:
-
-* Execute TestBots from GitHub Actions
-* Authenticate using a JWT token
-* Override the Test Bot ID during execution
-* Generate detailed execution reports
-* Publish JUnit test results to GitHub Checks
-* Upload execution artifacts for future reference
-* Display execution summaries directly in GitHub Actions
+Get it from the GitHub Marketplace: **https://github.com/marketplace/actions/run-testbot**
 
 ---
 
-# Prerequisites
+## Folder Structure
 
-Before using this action, ensure you have:
-
-1. An TestBot created and configured.
-2. A valid JWT token for API authentication.
-3. A GitHub repository where this action is installed.
-4. GitHub Actions enabled for the repository.
-
----
-
-# Repository Structure
+Add these two files to your repository:
 
 ```text
 .
 ├── .github/
 │   └── workflows/
-│       └── testbot-ci.yml
+│       └── testbot.yml
 │
-├── configs/
-│   └── testbot-config.json
-│
-├── action.yml
-├── package.json
-├── dist/
-└── README.md
+└── configs/
+    └── testbot-config.json
 ```
 
 ---
 
-# Step 1: Configure TestBot
+## 1. Add Your TestBot Configuration
 
-Create a configuration file:
-
-```text
-configs/testbot-config.json
-```
-
-Example:
+Create `configs/testbot-config.json` with your test bot's configuration JSON:
 
 ```json
 {
@@ -90,103 +58,69 @@ Example:
 }
 ```
 
----
+## 2. Add Your JWT Token
 
-## Required Fields
+`Settings → Secrets and Variables → Actions → New Repository Secret`
 
-| Field                    | Description                       |
-| ------------------------ | --------------------------------- |
-| `testBotId`              | Unique TestBot ID    |
-| `name`                   | Execution profile name            |
-| `executionConfiguration` | Test execution settings           |
-| `browser`                | Browser to execute tests          |
-| `osType`                 | Target operating system           |
-| `customProperties`       | Runtime variables used by TestBot |
+| Secret Name | Description |
+| --- | --- |
+| `TESTBOT_JWT_TOKEN` | JWT authentication token for the TestBot API |
 
----
+## 3. Add the Workflow
 
-# Step 2: Add JWT Token Secret
-
-Navigate to:
-
-```text
-GitHub Repository
-→ Settings
-→ Secrets and Variables
-→ Actions
-→ New Repository Secret
-```
-
-Create the following secret:
-
-| Secret Name         | Description                           |
-| ------------------- | ------------------------------------- |
-| `TESTBOT_JWT_TOKEN` | JWT Authentication Token |
-
----
-
-# Step 3: Create GitHub Workflow
-
-Create the file:
-
-```text
-.github/workflows/testbot-ci.yml
-```
-
-Example:
-
-## GitHub Workflow Features
-
-The provided GitHub workflow not only executes your TestBot but also generates a complete execution dashboard inside GitHub Actions.
-
-### Included Features
-
-| Feature                    | Description                                                 |
-| -------------------------- | ----------------------------------------------------------- |
-| TestBot Execution          | Executes TestBots directly from GitHub Actions |
-| Dynamic Configuration      | Supports runtime TestBot ID override                        |
-| Execution Monitoring       | Continuously polls execution status until completion        |
-| Raw JSON Results           | Displays complete execution payload                         |
-| JUnit XML Generation       | Generates CI/CD compatible test reports                     |
-| Markdown Report Generation | Creates human-readable execution reports                    |
-| GitHub Job Summary         | Publishes rich execution results in the Summary tab         |
-| GitHub Checks Integration  | Displays test results directly in GitHub Checks             |
-| Artifact Upload            | Stores reports for download and auditing                    |
-
----
-
-## Recommended Workflow
-
-Create the following workflow:
+Create `.github/workflows/testbot.yml`:
 
 ```yaml
-name: Run Test Bot CI/CD
+name: Run TestBot
 
 on:
   workflow_dispatch:
-    inputs:
-      test_bot_id:
-        description: 'Override testBotId'
-        required: false
-        default: ''
+
+permissions:
+  # write (not read) is required so the "Deploy Allure Report to GitHub
+  # Pages" step below can push the generated report to the gh-pages branch.
+  contents: write
+  checks: write
+  pull-requests: write
 
 jobs:
   run-testbot:
     runs-on: ubuntu-latest
+    timeout-minutes: 358
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare Configuration
+      # Pulls prior Allure report history (if any) from the gh-pages branch
+      # so this run's report shows trends across runs, not just this one.
+      # continue-on-error: the gh-pages branch won't exist yet on the very
+      # first run, which would otherwise fail this step.
+      - name: Get Allure History
+        uses: actions/checkout@v4
+        if: always()
+        continue-on-error: true
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      # actions/checkout always runs "git init" before fetching, so even a
+      # FAILED checkout above (e.g. gh-pages branch doesn't exist yet on the
+      # first run) leaves a broken .git/ folder inside gh-pages/. If that
+      # gets left in place, the Allure report action's Docker container (root
+      # inside the container) later copies it into allure-history/ as
+      # root-owned files, which the gh-pages deploy step (runs as the
+      # non-root "runner" user) can't strip out — corrupting its own orphan
+      # git checkout and making it push to the wrong branch. Removing it here
+      # unconditionally (works whether the checkout above succeeded or not)
+      # prevents that entirely.
+      - name: Strip .git From Allure History Checkout
+        if: always()
+        run: rm -rf gh-pages/.git
+
+      - name: Load Configuration
         id: prepare-config
         run: |
           CONFIG=$(cat configs/testbot-config.json)
-
-          OVERRIDE_ID="${{ github.event.inputs.test_bot_id }}"
-          if [ -n "$OVERRIDE_ID" ]; then
-            CONFIG=$(echo "$CONFIG" | jq --arg id "$OVERRIDE_ID" '.testBotId = $id')
-          fi
-
           EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
           echo "config<<$EOF" >> $GITHUB_OUTPUT
           echo "$CONFIG" >> $GITHUB_OUTPUT
@@ -194,411 +128,281 @@ jobs:
 
       - name: Run TestBot
         id: testbot
-        uses: ./
+        uses: testbots-ai/Run-Testbot@v1.0.2
+        timeout-minutes: 350
         with:
           jwt_token: ${{ secrets.TESTBOT_JWT_TOKEN }}
           test_bot_configuration: ${{ steps.prepare-config.outputs.config }}
           poll_interval_seconds: '5'
-          timeout_minutes: '60'
+          timeout_minutes: '345'
 
-      - name: Generate Reports
+      - name: Show Results
+        if: always()
         run: |
-          # Generates:
-          # - JUnit XML
-          # - Markdown Report
-          # - GitHub Summary
+          echo "Execution ID: ${{ steps.testbot.outputs.execution_id }}"
+          echo "Status: ${{ steps.testbot.outputs.status }}"
+          echo "Results Path: ${{ steps.testbot.outputs.results_path }}"
 
-      - name: Publish Results
+      - name: Generate Markdown Report
+        id: report
+        if: always() && steps.testbot.outputs.results_path != ''
+        run: |
+          set +e
+          REPORT_OUTPUT=$(python3 <<'PY' 2>&1
+          import json
+          from pathlib import Path
+
+          json_file = Path("${{ steps.testbot.outputs.results_path }}")
+
+          with open(json_file, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          Path("results").mkdir(exist_ok=True)
+
+          summary = data.get("summary", {})
+
+          md = []
+          md.append("# TestBot Execution Report")
+          md.append("")
+          md.append(f"**Execution ID:** {data.get('executionId')}")
+          md.append("")
+          md.append(f"**Bot:** {data.get('testBotName')}")
+          md.append("")
+          md.append(f"**Status:** {data.get('status')}")
+          md.append("")
+          md.append(f"**Duration:** {summary.get('formattedDuration')}")
+          md.append("")
+          md.append("## Summary")
+          md.append("")
+          md.append("| Metric | Value |")
+          md.append("|----------|----------|")
+          md.append(f"| Total Suites | {summary.get('totalSuites')} |")
+          md.append(f"| Passed Suites | {summary.get('passedSuites')} |")
+          md.append(f"| Failed Suites | {summary.get('failedSuites')} |")
+          md.append(f"| Total Scripts | {summary.get('totalScripts')} |")
+          md.append(f"| Passed Scripts | {summary.get('passedScripts')} |")
+          md.append(f"| Failed Scripts | {summary.get('failedScripts')} |")
+
+          for suite in data.get("testSuiteResults", []):
+              md.append("")
+              md.append(f"## Suite: {suite.get('testSuiteName', 'Suite')}")
+              md.append("")
+              for script in suite.get("testScriptResults", []):
+                  icon = "✅" if script.get("resultStatus") == "PASSED" else "❌"
+                  md.append(f"### {icon} {script.get('testScriptName', 'Test')}")
+                  for iteration in script.get("iterations", []):
+                      md.append("")
+                      md.append("| Step | Status | Description |")
+                      md.append("|------|--------|-------------|")
+                      for step in iteration.get("stepResults", []):
+                          status = step.get("resultStatus")
+                          emoji = "✅" if status == "PASSED" else "❌"
+                          md.append(f"| {step.get('sequence')} | {emoji} {status} | {step.get('testStepName')} |")
+
+          Path("results/report.md").write_text("\n".join(md), encoding="utf-8")
+          print("Generated: results/report.md")
+          PY
+          )
+          REPORT_EXIT=$?
+          set -e
+
+          echo "$REPORT_OUTPUT"
+
+          if [ $REPORT_EXIT -ne 0 ]; then
+            echo "::warning::Report generation failed: $(echo "$REPORT_OUTPUT" | tail -c 500 | tr '\n\r' '  ')"
+          fi
+
+      # simple-elf/allure-report-action (below) only formats an existing
+      # allure-results/ folder — it doesn't generate one. This step converts
+      # the TestBot JSON results into Allure's own per-test result format
+      # (one <uuid>-result.json file per test script) so there's real data
+      # for it to render instead of an empty report.
+      - name: Generate Allure Results
+        if: always() && steps.testbot.outputs.results_path != ''
+        run: |
+          python3 <<'PY'
+          import json
+          import time
+          import uuid
+          from pathlib import Path
+
+          json_file = Path("${{ steps.testbot.outputs.results_path }}")
+
+          with open(json_file, "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          out_dir = Path("allure-results")
+          out_dir.mkdir(exist_ok=True)
+
+          now_ms = int(time.time() * 1000)
+
+          def allure_status(result_status):
+              return "passed" if result_status == "PASSED" else "failed"
+
+          for ts in data.get("testSuiteResults", []):
+              suite_name = ts.get("testSuiteName", "Suite")
+              for script in ts.get("testScriptResults", []):
+                  script_name = script.get("testScriptName", "Test")
+
+                  steps = []
+                  for iteration in script.get("iterations", []):
+                      for step in iteration.get("stepResults", []):
+                          steps.append({
+                              "name": f"{step.get('sequence')}: {step.get('testStepName', 'Step')}",
+                              "status": allure_status(step.get("resultStatus")),
+                              "stage": "finished",
+                              "start": now_ms,
+                              "stop": now_ms,
+                          })
+
+                  result = {
+                      "uuid": str(uuid.uuid4()),
+                      "historyId": f"{suite_name}::{script_name}",
+                      "name": script_name,
+                      "status": allure_status(script.get("resultStatus")),
+                      "stage": "finished",
+                      "start": now_ms,
+                      "stop": now_ms,
+                      "labels": [
+                          {"name": "suite", "value": suite_name},
+                          {"name": "framework", "value": "AutomationHQ TestBot"},
+                      ],
+                      "steps": steps,
+                  }
+
+                  result_file = out_dir / f"{result['uuid']}-result.json"
+                  result_file.write_text(json.dumps(result), encoding="utf-8")
+
+          print(f"Generated Allure results in {out_dir}")
+          PY
+
+      # Generate Allure Report via Action
+      - name: Generate Allure Report
+        uses: simple-elf/allure-report-action@v1.15
+        if: always()
+        with:
+          allure_results: allure-results
+          allure_history: allure-history
+
+      # Second layer of defense against the same root-owned-.git problem
+      # described above the "Strip .git From Allure History Checkout" step:
+      # if the Allure report action's container ever copies a .git/ folder
+      # into allure-history/ some other way, it'd be root-owned and this
+      # step's own "rm" (running as the non-root "runner" user) can't remove
+      # it — sudo is needed regardless of ownership.
+      - name: Strip Any Nested .git From Allure History
+        if: always()
+        run: sudo rm -rf allure-history/.git
+
+      # Publishes allure-history (this run's report + prior history) to the
+      # gh-pages branch, which is what actually gives the report a URL.
+      # Requires GitHub Pages enabled on this repo: Settings → Pages →
+      # Source: "Deploy from a branch" → Branch: gh-pages / (root).
+      - name: Deploy Allure Report to GitHub Pages
+        if: always()
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: allure-history
+          keep_files: true
+
+      - name: Publish GitHub Job Summary
+        if: always()
+        env:
+          EXECUTION_ID: ${{ steps.testbot.outputs.execution_id }}
+          FINAL_STATUS: ${{ steps.testbot.outputs.status }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          # This is GitHub Pages' standard URL pattern for a project site served
+          # from a branch (what the "Deploy Allure Report to GitHub Pages" step
+          # sets up) — it's always this shape, not something the API returns.
+          # Requires GitHub Pages to actually be enabled once on this repo:
+          # Settings → Pages → Source: "Deploy from a branch" → gh-pages / (root).
+          ALLURE_REPORT_URL="https://${REPO_OWNER}.github.io/${REPO_NAME}/"
+
+          {
+            echo "## TestBot Run Status"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Execution ID | ${EXECUTION_ID:-N/A} |"
+            echo "| Status | ${FINAL_STATUS:-DID NOT COMPLETE} |"
+            echo "| Allure Report | [${ALLURE_REPORT_URL}](${ALLURE_REPORT_URL}) (requires GitHub Pages enabled once — see README) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f results/report.md ]; then
+            cat results/report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Publish Test Results
+        if: always()
         uses: EnricoMi/publish-unit-test-result-action@v2
         with:
-          files: results/junit-results.xml
+          files: results/junit.xml
 
       - name: Upload Reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: testbot-results
+          name: testbot-results-${{ github.run_number }}
           path: results/
 ```
 
+Trigger it from the **Actions** tab → **Run TestBot** → **Run workflow**.
+
 ---
 
-# Rich GitHub Reporting
+## 4. Enable GitHub Pages (for the Allure Report)
 
-After execution completes, users can review results directly within GitHub without downloading any files.
-
-## 1. Workflow Summary
-
-A detailed execution report is automatically published to:
-
-GitHub Actions → Workflow Run → Summary
-
-The summary contains:
-
-* Execution ID
-* TestBot Name
-* Final Status
-* Execution Duration
-* Total Suites
-* Passed Suites
-* Failed Suites
-* Total Scripts
-* Passed Scripts
-* Failed Scripts
-* Step-Level Results
-
-Example:
+One-time setup, needed for the Allure Report step to produce a real, browsable report URL:
 
 ```text
-🤖 TestBot Execution Report
-
-Execution ID: 123456
-
-Bot: Login Regression Suite
-
-Status: PASSED
-
-Duration: 00:03:42
-
-Summary
-
-Total Suites: 5
-Passed Suites: 5
-Failed Suites: 0
-
-Total Scripts: 28
-Passed Scripts: 28
-Failed Scripts: 0
+Repo → Settings → Pages → Source: "Deploy from a branch" → Branch: gh-pages / (root) → Save
 ```
 
----
+The `gh-pages` branch doesn't need to exist yet — the workflow's **Deploy Allure Report to GitHub Pages** step creates and pushes to it automatically on the first run.
 
-## 2. GitHub Checks Integration
-
-JUnit reports are automatically published to GitHub Checks.
-
-Benefits:
-
-* Pass/Fail indicators
-* Test result visibility
-* Pull Request integration
-* CI/CD compliance
-
-Users can open the Checks tab and view failed test cases immediately.
-
----
-
-## 3. Detailed Markdown Report
-
-A comprehensive Markdown report is generated:
+**Where to see the report:** after a run completes, open:
 
 ```text
-results/report.md
+https://<your-github-username-or-org>.github.io/<your-repo-name>/
 ```
 
-The report includes:
-
-* Suite-level results
-* Script-level results
-* Iteration-level details
-* Step execution status
-* Pass/Fail indicators
-
-Example:
-
-```text
-Suite: Login Tests
-
-✅ Successful Login
-
-| Step | Status | Description |
-|------|--------|-------------|
-| 1 | PASSED | Open Login Page |
-| 2 | PASSED | Enter Username |
-| 3 | PASSED | Enter Password |
-| 4 | PASSED | Click Login |
-```
+It may take a minute or two after the first run for Pages to finish publishing. Every subsequent run updates this same URL in place, and keeps up to the last 20 runs' history (via `keep_reports: 20`, the action's default) so you can see pass/fail trends over time, not just the latest run.
 
 ---
 
-## 4. Raw Execution Results
+## Timeouts Used in This Workflow
 
-The complete execution response from the TestBot platform is available as JSON:
+| Timeout | Value | What it controls |
+| --- | --- | --- |
+| `timeout_minutes` (input) | 345 min | How long the action itself polls the TestBot before giving up |
+| `timeout-minutes` on the **Run TestBot** step | 350 min | GitHub's own limit for that step — kept a few minutes above `timeout_minutes` |
+| `timeout-minutes` on the **job** | 358 min | Overall limit for the whole job — kept a few minutes above the step timeout |
 
-```text
-results/execution-result.json
-```
-
-Useful for:
-
-* Debugging
-* Auditing
-* Custom reporting
-* External integrations
+These are set right under GitHub's hard 360-minute (6h) cap for `ubuntu-latest` runners, since TestBot runs can take up to ~5h45m. If your tests are shorter, you can lower all three.
 
 ---
 
-## 5. Downloadable Artifacts
+## Keeping Up to Date
 
-All generated reports are uploaded automatically.
-
-Navigate to:
-
-GitHub Actions → Workflow Run → Artifacts
-
-Download:
-
-```text
-testbot-results-<run_number>
-```
-
-Included files:
-
-```text
-results/
-├── junit-results.xml
-├── report.md
-├── execution-result.json
-└── additional result files
-```
-
----
-
-# What Users See After Running the Workflow
-
-```text
-GitHub Actions
-│
-├── Workflow Logs
-│   ├── Configuration Loaded
-│   ├── TestBot Started
-│   ├── Execution Progress
-│   └── Execution Completed
-│
-├── Summary Tab
-│   ├── Execution Metrics
-│   ├── Suite Results
-│   ├── Script Results
-│   └── Step Results
-│
-├── Checks Tab
-│   └── JUnit Test Results
-│
-└── Artifacts
-    ├── report.md
-    ├── junit-results.xml
-    └── execution-result.json
-```
-
-This provides a complete test execution experience directly within GitHub, making it easy for QA engineers, developers, and release teams to review TestBot results without leaving the GitHub Actions interface.
-
-
-
----
-
-
-# Action Inputs
-
-| Input                    | Required | Default | Description                                 |
-| ------------------------ | -------- | ------- | ------------------------------------------- |
-| `jwt_token`              | Yes      | -       | JWT token used for authentication           |
-| `test_bot_configuration` | Yes      | -       | Full TestBot configuration JSON             |
-| `poll_interval_seconds`  | No       | 5       | Polling interval while execution is running |
-| `timeout_minutes`        | No       | 60      | Maximum wait time for execution completion  |
-
----
-
-# Action Outputs
-
-| Output         | Description                        |
-| -------------- | ---------------------------------- |
-| `execution_id` | TestBot execution identifier       |
-| `status`       | Final execution status             |
-| `results_path` | Location of generated results JSON |
-
-Example:
+This line pins the workflow to a specific version:
 
 ```yaml
-- name: Show Results
-  run: |
-    echo "Execution ID: ${{ steps.testbot.outputs.execution_id }}"
-    echo "Status: ${{ steps.testbot.outputs.status }}"
-    echo "Results Path: ${{ steps.testbot.outputs.results_path }}"
+uses: testbots-ai/Run-Testbot@v1.0.2
 ```
+
+Whenever a new version is released, that's the **only line you need to change** — bump `v1.0.2` to the new version (e.g. `v1.0.3`). Nothing else in the file changes.
 
 ---
 
-# Generated Reports
+## Troubleshooting
 
-After execution completes, the workflow automatically generates:
-
-## Raw Result JSON
-
-```text
-results/execution-result.json
-```
-
-Contains complete execution details returned by the TestBot API.
-
----
-
-## JUnit XML
-
-```text
-results/junit-results.xml
-```
-
-Used for:
-
-* GitHub Checks
-* CI/CD integrations
-* Test reporting tools
-
----
-
-## Markdown Report
-
-```text
-results/report.md
-```
-
-Contains:
-
-* Execution summary
-* Suite results
-* Script results
-* Step-level execution details
-
----
-
-# GitHub Actions Summary
-
-A detailed execution report is automatically published to:
-
-```text
-GitHub Actions
-→ Workflow Run
-→ Summary
-```
-
-This includes:
-
-* Execution ID
-* TestBot Name
-* Status
-* Duration
-* Suite Summary
-* Script Summary
-* Step Results
-
----
-
-# GitHub Checks Integration
-
-JUnit results are published automatically as GitHub Checks.
-
-Features:
-
-* Pass/Fail indicators
-* Test statistics
-* Pull Request visibility
-* Workflow integration
-
----
-
-# Downloading Artifacts
-
-Execution reports are uploaded as workflow artifacts.
-
-Navigate to:
-
-```text
-GitHub Actions
-→ Workflow Run
-→ Artifacts
-```
-
-Download:
-
-```text
-testbot-results-<run_number>
-```
-
-Included files:
-
-```text
-results/
-├── junit-results.xml
-├── report.md
-└── *.json
-```
-
----
-
-# Example Workflow Execution
-
-```text
-1. User triggers workflow
-2. Configuration loaded
-3. JWT authentication performed
-4. TestBot execution started
-5. Workflow polls execution status
-6. Results downloaded
-7. JUnit report generated
-8. Markdown report generated
-9. Results published to GitHub Checks
-10. Artifacts uploaded
-11. Summary displayed in GitHub Actions
-```
-
----
-
-# Troubleshooting
-
-## Authentication Failure
-
-Verify:
-
-* JWT token exists in GitHub Secrets
-* Token is valid and not expired
-
-Required secret:
-
-```text
-TESTBOT_JWT_TOKEN
-```
-
----
-
-## Invalid TestBot ID
-
-Verify:
-
-* `testBotId` exists
-* TestBot is accessible
-* Correct environment is being used
-
----
-
-## Workflow Timeout
-
-Increase:
-
-```yaml
-with:
-  timeout_minutes: '120'
-```
-
-Or reduce execution time inside the TestBot.
-
----
-
-# Support
-
-For issues related to:
-
-* TestBot execution
-* Authentication
-* Configuration
-* CI/CD integration
-
-Contact your TestBots administrator or support team.
+| Symptom | Fix |
+| --- | --- |
+| Authentication failure | Confirm `TESTBOT_JWT_TOKEN` exists in repo secrets and hasn't expired |
+| Invalid TestBot ID | Confirm `testBotId` in `configs/testbot-config.json` exists and is accessible |
+| `403 Forbidden` / `Resource not accessible by integration` | Make sure the `permissions:` block (`contents: read`, `checks: write`, `pull-requests: write`) is present near the top of the workflow |
+| Workflow times out | Raise `timeout_minutes`, the step's `timeout-minutes`, and the job's `timeout-minutes` together — keep all three under GitHub's 360-minute cap for `ubuntu-latest` |
